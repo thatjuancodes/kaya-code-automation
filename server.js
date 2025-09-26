@@ -73,13 +73,15 @@ async function writeFile(filePath, content, workspaceDir = WORKSPACE_DIR) {
 }
 
 // Git operations - always push to staging
-async function gitCommitAndPushToStaging(prompt, changes, workspaceDir = WORKSPACE_DIR) {
+async function gitCommitAndPushToStaging(prompt, changes, workspaceDir = WORKSPACE_DIR, force = false) {
+  const originalCwd = process.cwd();
+  
   try {
-    // Change to workspace directory
-    process.chdir(workspaceDir);
+    // Get absolute path for workspace directory
+    const absoluteWorkspaceDir = path.resolve(workspaceDir);
     
     // Check git status
-    const { stdout: status } = await execPromise('git status --porcelain');
+    const { stdout: status } = await execPromise('git status --porcelain', { cwd: absoluteWorkspaceDir });
     
     if (!status.trim()) {
       console.log('⚠️  No changes to commit');
@@ -90,55 +92,77 @@ async function gitCommitAndPushToStaging(prompt, changes, workspaceDir = WORKSPA
     
     // Switch to staging branch (or create if doesn't exist)
     try {
-      await execPromise('git checkout staging');
+      await execPromise('git checkout staging', { cwd: absoluteWorkspaceDir });
       console.log('✅ Switched to staging branch');
     } catch {
       // Branch doesn't exist, create it
-      await execPromise('git checkout -b staging');
+      await execPromise('git checkout -b staging', { cwd: absoluteWorkspaceDir });
       console.log('🌿 Created staging branch');
     }
     
-    // Pull latest from staging to avoid conflicts
-    try {
-      await execPromise('git pull origin staging');
-      console.log('⬇️  Pulled latest from staging');
-    } catch (e) {
-      console.log('ℹ️  No remote staging yet or conflicts (continuing...)');
+    // Pull latest from staging to avoid conflicts (skip if force pushing)
+    if (!force) {
+      try {
+        await execPromise('git pull origin staging', { cwd: absoluteWorkspaceDir });
+        console.log('⬇️  Pulled latest from staging');
+      } catch (e) {
+        console.log('ℹ️  No remote staging yet or conflicts (continuing...)');
+      }
     }
     
     // Stage all changes
-    await execPromise('git add .');
+    await execPromise('git add .', { cwd: absoluteWorkspaceDir });
     console.log('✅ Staged changes');
     
     // Commit with AI prefix
     const commitMessage = `AI: ${prompt.slice(0, 72)}`;
-    await execPromise(`git commit -m "${commitMessage.replace(/"/g, '\\"')}"`);
+    await execPromise(`git commit -m "${commitMessage.replace(/"/g, '\\"')}"`, { cwd: absoluteWorkspaceDir });
     console.log('💾 Committed:', commitMessage);
     
-    // Push to staging
-    await execPromise('git push origin staging');
-    console.log('🚀 Pushed to staging → Netlify will auto-deploy');
+    // Push to staging (with force if requested)
+    const pushCommand = force ? 'git push --force origin staging' : 'git push origin staging';
+    await execPromise(pushCommand, { cwd: absoluteWorkspaceDir });
+    console.log(`🚀 ${force ? 'Force pushed' : 'Pushed'} to staging → Netlify will auto-deploy`);
     
     return {
       success: true,
       branch: 'staging',
       commitMessage,
       changes: changes,
-      message: 'Pushed to staging - check Netlify for deployment'
+      message: `${force ? 'Force pushed' : 'Pushed'} to staging - check Netlify for deployment`,
+      forcePushed: force
     };
     
   } catch (error) {
     console.error('❌ Git error:', error.message);
+    
+    // Check if this is a non-fast-forward error
+    const errorText = error.message.toLowerCase();
+    const isNonFastForward = errorText.includes('non-fast-forward') || 
+                            errorText.includes('rejected') ||
+                            errorText.includes('failed to push some refs') ||
+                            errorText.includes('behind') ||
+                            (errorText.includes('updates were rejected') && errorText.includes('tip'));
+    
+    console.log('🔍 Git error analysis:');
+    console.log('  - Error text:', errorText);
+    console.log('  - Can force push:', isNonFastForward);
+    
     return {
       success: false,
-      error: error.message
+      error: error.message,
+      canForcePush: isNonFastForward,
+      gitError: true
     };
+  } finally {
+    // Always restore original working directory
+    process.chdir(originalCwd);
   }
 }
 
 // Main endpoint
 app.post('/code', async (req, res) => {
-  const { prompt, skipGit = false, projectId, directoryName } = req.body;
+  const { prompt, skipGit = false, projectId, directoryName, forceGit = false } = req.body;
   
   if (!prompt) {
     return res.status(400).json({ error: 'Prompt is required' });
@@ -174,32 +198,44 @@ app.post('/code', async (req, res) => {
 CURRENT REPOSITORY STRUCTURE:
 ${fileTree}
 
-INSTRUCTIONS:
-1. Analyze the user's request
-2. Determine which files need to be read or modified
-3. Respond with JSON actions in this format:
+CRITICAL ASSUMPTION: Every user request expects you to make actual code changes unless explicitly stated otherwise (e.g., "just explain", "don't modify", "read only").
+
+MANDATORY WORKFLOW:
+1. Read the relevant files to understand current state
+2. Make the requested changes by writing modified files
+3. Only complete after making actual file modifications
+
+USER EXPECTATIONS:
+- The user ALWAYS wants code changes made
+- If you think no changes are needed, you're probably wrong - look harder
+- Every prompt should result in at least one file being written
+- If the code already looks correct, improve it, add comments, or optimize it
+
+Available actions:
 
 For reading a file:
 {
   "action": "read_file",
   "file": "path/to/file.js",
-  "reason": "why you need to read it"
+  "reason": "Need to understand current implementation"
 }
 
-For modifying a file:
+For modifying a file (REQUIRED for every request):
 {
   "action": "write_file",
   "file": "path/to/file.js",
-  "content": "FULL NEW FILE CONTENT HERE"
+  "content": "COMPLETE NEW FILE CONTENT WITH CHANGES"
 }
 
-For completion:
+For completion (ONLY after writing files):
 {
   "action": "complete",
-  "summary": "Brief summary of changes made"
+  "summary": "Specific changes made to which files"
 }
 
-RESPOND WITH ONE JSON OBJECT PER MESSAGE. Start by reading any files you need, then make modifications.`;
+FAILURE MODE TO AVOID: Never complete without writing files. If you complete without changes, you have failed the user's request.
+
+WORKFLOW: Read files → Write modified files → Complete. No exceptions.`;
 
     const conversationHistory = [
       { 
@@ -274,8 +310,10 @@ RESPOND WITH ONE JSON OBJECT PER MESSAGE. Start by reading any files you need, t
         
         // Auto push to staging unless explicitly skipped
         if (!skipGit && changes.length > 0) {
-          console.log('🔄 Auto-pushing to staging...');
-          gitResult = await gitCommitAndPushToStaging(prompt, changes, workspaceDir);
+          console.log(`🔄 Auto-${forceGit ? 'force ' : ''}pushing to staging...`);
+          gitResult = await gitCommitAndPushToStaging(prompt, changes, workspaceDir, forceGit);
+        } else if (!skipGit && changes.length === 0) {
+          console.log('⚠️ No changes were made to files, skipping git push');
         }
         
         return res.json({
@@ -352,10 +390,70 @@ RESPOND WITH ONE JSON OBJECT PER MESSAGE. Start by reading any files you need, t
 
 // New endpoint: Just push to staging (without code changes)
 app.post('/git/push-staging', async (req, res) => {
-  const { message = 'Manual changes' } = req.body;
+  const { message = 'Manual changes', force = false, directoryName } = req.body;
   
-  const result = await gitCommitAndPushToStaging(message, []);
+  // Determine workspace directory
+  let workspaceDir = WORKSPACE_DIR;
+  if (directoryName) {
+    workspaceDir = path.join(WORKSPACE_DIR, directoryName);
+  }
+  
+  const result = await gitCommitAndPushToStaging(message, [], workspaceDir, force);
   return res.json(result);
+});
+
+// Force push endpoint for retrying failed pushes
+app.post('/git/force-push', async (req, res) => {
+  const { projectId, directoryName, message = 'Force push retry' } = req.body;
+  
+  if (!directoryName) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Directory name is required for force push' 
+    });
+  }
+
+  // Determine workspace directory
+  const workspaceDir = path.join(WORKSPACE_DIR, directoryName);
+  
+  // Verify the project directory exists
+  const projectExists = await fs.access(workspaceDir).then(() => true).catch(() => false);
+  if (!projectExists) {
+    return res.status(400).json({ 
+      success: false,
+      error: `Project directory '${directoryName}' not found.` 
+    });
+  }
+
+  console.log('🔄 Force pushing to staging for project:', directoryName);
+  
+  try {
+    // Get absolute path for workspace directory
+    const absoluteWorkspaceDir = path.resolve(workspaceDir);
+    
+    // Make sure we're on staging branch
+    await execPromise('git checkout staging', { cwd: absoluteWorkspaceDir });
+    console.log('✅ On staging branch');
+    
+    // Simply force push whatever is currently committed
+    await execPromise('git push --force origin staging', { cwd: absoluteWorkspaceDir });
+    console.log('🚀 Force pushed to staging → Netlify will auto-deploy');
+    
+    return res.json({
+      success: true,
+      branch: 'staging',
+      message: 'Force pushed to staging - check Netlify for deployment',
+      forcePushed: true
+    });
+    
+  } catch (error) {
+    console.error('❌ Force push error:', error.message);
+    return res.json({
+      success: false,
+      error: error.message,
+      gitError: true
+    });
+  }
 });
 
 // Project Management Endpoints
@@ -391,18 +489,17 @@ app.post('/projects', async (req, res) => {
       console.log('✅ Repository cloned successfully');
       
       // Switch to staging branch (or create if doesn't exist)
-      process.chdir(projectDir);
       try {
-        await execPromise('git checkout staging');
+        await execPromise('git checkout staging', { cwd: projectDir });
         console.log('✅ Switched to staging branch');
       } catch {
         // Branch doesn't exist, create it
-        await execPromise('git checkout -b staging');
+        await execPromise('git checkout -b staging', { cwd: projectDir });
         console.log('🌿 Created staging branch');
         
         // Push staging branch to remote
         try {
-          await execPromise('git push -u origin staging');
+          await execPromise('git push -u origin staging', { cwd: projectDir });
           console.log('🚀 Pushed staging branch to remote');
         } catch (pushError) {
           console.log('⚠️  Could not push staging branch:', pushError.message);
@@ -411,9 +508,6 @@ app.post('/projects', async (req, res) => {
     } else {
       console.log('📁 Directory already exists, skipping clone');
     }
-
-    // Return to original directory
-    process.chdir(__dirname);
 
     return res.json({
       success: true,
