@@ -55,9 +55,9 @@ async function getFileTree(dir, prefix = '') {
 }
 
 // Read file content
-async function readFile(filePath) {
+async function readFile(filePath, workspaceDir = WORKSPACE_DIR) {
   try {
-    const fullPath = path.join(WORKSPACE_DIR, filePath);
+    const fullPath = path.join(workspaceDir, filePath);
     const content = await fs.readFile(fullPath, 'utf8');
     return content;
   } catch (error) {
@@ -66,17 +66,17 @@ async function readFile(filePath) {
 }
 
 // Write file content
-async function writeFile(filePath, content) {
-  const fullPath = path.join(WORKSPACE_DIR, filePath);
+async function writeFile(filePath, content, workspaceDir = WORKSPACE_DIR) {
+  const fullPath = path.join(workspaceDir, filePath);
   await fs.mkdir(path.dirname(fullPath), { recursive: true });
   await fs.writeFile(fullPath, content, 'utf8');
 }
 
 // Git operations - always push to staging
-async function gitCommitAndPushToStaging(prompt, changes) {
+async function gitCommitAndPushToStaging(prompt, changes, workspaceDir = WORKSPACE_DIR) {
   try {
     // Change to workspace directory
-    process.chdir(WORKSPACE_DIR);
+    process.chdir(workspaceDir);
     
     // Check git status
     const { stdout: status } = await execPromise('git status --porcelain');
@@ -138,18 +138,33 @@ async function gitCommitAndPushToStaging(prompt, changes) {
 
 // Main endpoint
 app.post('/code', async (req, res) => {
-  const { prompt, skipGit = false } = req.body;
+  const { prompt, skipGit = false, projectId, directoryName } = req.body;
   
   if (!prompt) {
     return res.status(400).json({ error: 'Prompt is required' });
   }
 
+  // Determine workspace directory
+  let workspaceDir = WORKSPACE_DIR;
+  if (directoryName) {
+    workspaceDir = path.join(WORKSPACE_DIR, directoryName);
+    
+    // Verify the project directory exists
+    const projectExists = await fs.access(workspaceDir).then(() => true).catch(() => false);
+    if (!projectExists) {
+      return res.status(400).json({ 
+        error: `Project directory '${directoryName}' not found. Please ensure the project is properly created.` 
+      });
+    }
+  }
+
   console.log('📝 Received prompt:', prompt);
+  console.log('📁 Working directory:', workspaceDir);
   console.log('🔧 Skip git:', skipGit);
   
   try {
     // Get repository structure
-    const fileTree = await getFileTree(WORKSPACE_DIR);
+    const fileTree = await getFileTree(workspaceDir);
     
     console.log('🌳 File tree:', fileTree);
 
@@ -260,7 +275,7 @@ RESPOND WITH ONE JSON OBJECT PER MESSAGE. Start by reading any files you need, t
         // Auto push to staging unless explicitly skipped
         if (!skipGit && changes.length > 0) {
           console.log('🔄 Auto-pushing to staging...');
-          gitResult = await gitCommitAndPushToStaging(prompt, changes);
+          gitResult = await gitCommitAndPushToStaging(prompt, changes, workspaceDir);
         }
         
         return res.json({
@@ -274,7 +289,7 @@ RESPOND WITH ONE JSON OBJECT PER MESSAGE. Start by reading any files you need, t
 
       // Handle read file
       if (action.action === 'read_file') {
-        const fileContent = await readFile(action.file);
+        const fileContent = await readFile(action.file, workspaceDir);
         
         if (fileContent === null) {
           conversationHistory.push(
@@ -295,7 +310,7 @@ RESPOND WITH ONE JSON OBJECT PER MESSAGE. Start by reading any files you need, t
 
       // Handle write file
       if (action.action === 'write_file') {
-        await writeFile(action.file, action.content);
+        await writeFile(action.file, action.content, workspaceDir);
         changes.push({
           file: action.file,
           action: 'modified'
@@ -341,6 +356,145 @@ app.post('/git/push-staging', async (req, res) => {
   
   const result = await gitCommitAndPushToStaging(message, []);
   return res.json(result);
+});
+
+// Project Management Endpoints
+
+// Create a new project (clone repo if needed)
+app.post('/projects', async (req, res) => {
+  const { project, cloneUrl } = req.body;
+
+  if (!project || !cloneUrl) {
+    return res.status(400).json({ 
+      success: false, 
+      error: 'Project details and clone URL are required' 
+    });
+  }
+
+  console.log('📂 Creating project:', project.name);
+  console.log('🔗 Clone URL:', cloneUrl);
+
+  try {
+    const projectDir = path.join(WORKSPACE_DIR, project.directoryName);
+    
+    // Check if directory already exists
+    const dirExists = await fs.access(projectDir).then(() => true).catch(() => false);
+    
+    if (!dirExists) {
+      console.log('📥 Cloning repository...');
+      
+      // Create workspace directory if it doesn't exist
+      await fs.mkdir(WORKSPACE_DIR, { recursive: true });
+      
+      // Clone the repository
+      await execPromise(`git clone ${cloneUrl} ${projectDir}`);
+      console.log('✅ Repository cloned successfully');
+      
+      // Switch to staging branch (or create if doesn't exist)
+      process.chdir(projectDir);
+      try {
+        await execPromise('git checkout staging');
+        console.log('✅ Switched to staging branch');
+      } catch {
+        // Branch doesn't exist, create it
+        await execPromise('git checkout -b staging');
+        console.log('🌿 Created staging branch');
+        
+        // Push staging branch to remote
+        try {
+          await execPromise('git push -u origin staging');
+          console.log('🚀 Pushed staging branch to remote');
+        } catch (pushError) {
+          console.log('⚠️  Could not push staging branch:', pushError.message);
+        }
+      }
+    } else {
+      console.log('📁 Directory already exists, skipping clone');
+    }
+
+    // Return to original directory
+    process.chdir(__dirname);
+
+    return res.json({
+      success: true,
+      project: {
+        ...project,
+        directoryName: project.directoryName,
+        cloned: !dirExists
+      }
+    });
+
+  } catch (error) {
+    console.error('❌ Project creation error:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// List all projects (scan workspace directory)
+app.get('/projects', async (req, res) => {
+  try {
+    const workspaceExists = await fs.access(WORKSPACE_DIR).then(() => true).catch(() => false);
+    
+    if (!workspaceExists) {
+      return res.json({
+        success: true,
+        projects: []
+      });
+    }
+
+    const entries = await fs.readdir(WORKSPACE_DIR, { withFileTypes: true });
+    const projectDirs = entries
+      .filter(entry => entry.isDirectory() && !entry.name.startsWith('.'))
+      .map(entry => ({
+        directoryName: entry.name,
+        exists: true
+      }));
+
+    return res.json({
+      success: true,
+      projects: projectDirs
+    });
+
+  } catch (error) {
+    console.error('❌ Failed to list projects:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// Delete a project (remove directory)
+app.delete('/projects/:directoryName', async (req, res) => {
+  const { directoryName } = req.params;
+  
+  try {
+    const projectDir = path.join(WORKSPACE_DIR, directoryName);
+    
+    // Check if directory exists
+    const dirExists = await fs.access(projectDir).then(() => true).catch(() => false);
+    
+    if (dirExists) {
+      // Remove directory recursively
+      await fs.rm(projectDir, { recursive: true, force: true });
+      console.log('🗑️  Deleted project directory:', directoryName);
+    }
+
+    return res.json({
+      success: true,
+      message: `Project ${directoryName} deleted`
+    });
+
+  } catch (error) {
+    console.error('❌ Failed to delete project:', error);
+    return res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
 });
 
 // Health check
